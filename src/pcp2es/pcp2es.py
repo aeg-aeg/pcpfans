@@ -20,7 +20,6 @@ import time
 import json
 
 from elasticsearch import Elasticsearch
-from elasticsearch import helpers
 from pcp import pmapi
 import cpmapi as c_api
 
@@ -119,22 +118,10 @@ network.""")
             sys.stderr.write("No acceptable metrics specified.\n")
             raise pmapi.pmUsageErr()
 
-        # Create elasticsearch "index" (group-of-documents) and "mapping"
-        # (document metadata)
+        # Create elasticsearch "index" (group-of-documents); no mapping
         self.es = Elasticsearch(hosts=[self.elasticsearch_host])
-        es_mapping = {'result': {
-            'properties': {
-                '@timestamp' : {'type': 'date'}, # UTC milliseconds
-                'host-id' : {'type': 'string'},
-                'metric' : {'type': 'string'},
-                'instance' : {'type': 'string'},
-                'str-value' : {'type': 'string'},
-                'num-value' : {'type': 'double'}
-                }
-            } }
         self.es.indices.create(index=self.es_index,
-                               ignore=[400], # duplicates allowed
-                               body={'mappings': es_mapping})
+                               ignore=[400]) # duplicates allowed
         
         # Report what we're about to do
         print("Relaying %d %smetric(s) with es_index %s from %s "
@@ -225,7 +212,7 @@ network.""")
             bulk_message = []
             for t in miv_tuples:
                 message = {"_index":"pcp", # see create_index
-                           "_type":"result", # see es_mapping
+                           "_type":"result",
                            # no _id; auto-generate
                            "_source": t}
                 bulk_message.append(message)
@@ -262,54 +249,64 @@ network.""")
                 if float(sample_time_ms/1000.0) > float(endtime.tv_sec):
                     raise SystemExit
 
-        miv_tuples = []
+        # assemble all metrics into a single document
+        es_doc = {'host-id': self.hostid,
+                  '@timestamp': long(sample_time_ms),
+                  'metrics': {}}
 
         for i, name in enumerate(self.metrics):
             for j in range(0, result.contents.get_numval(i)):
                 # a fetch or other error will just omit that data value
                 # from the elasticsearch-bound set
                 try:
-                    # XXX: handle strings too
-                      
-                    atom = self.context.pmExtractValue(
-                        result.contents.get_valfmt(i),
-                        result.contents.get_vlist(i, j),
-                        self.descs[i].contents.type, c_api.PM_TYPE_DOUBLE)
-
                     inst = result.contents.get_vlist(i, j).inst
                     if inst is None or inst < 0:
                         inst_name = None
                     else:
                         inst_name = self.context.pmNameInDom(self.descs[i], inst)
 
-                    # Rescale if desired
-                    if self.units is not None:
-                        atom = self.context.pmConvScale(c_api.PM_TYPE_DOUBLE,
-                                                        atom,
-                                                        self.descs, i,
-                                                        self.units)
 
-                    if self.units_mult is not None:
-                        atom.d = atom.d * self.units_mult
+                    if (self.descs[i].contents.type == c_api.PM_TYPE_STRING):
+                        atom = self.context.pmExtractValue(
+                            result.contents.get_valfmt(i),
+                            result.contents.get_vlist(i, j),
+                            self.descs[i].contents.type, c_api.PM_TYPE_STRING)
+                        value = atom.cp
+                    else:
+                        atom = self.context.pmExtractValue(
+                            result.contents.get_valfmt(i),
+                            result.contents.get_vlist(i, j),
+                            self.descs[i].contents.type, c_api.PM_TYPE_DOUBLE)
+                        # Rescale if desired
+                        if self.units is not None:
+                            atom = self.context.pmConvScale(c_api.PM_TYPE_DOUBLE,
+                                                            atom,
+                                                            self.descs, i,
+                                                            self.units)
+                            if self.units_mult is not None:
+                                atom.d = atom.d * self.units_mult
+                        value = atom.d
 
-                    # Construct elasticsearch JSON document according to
-                    # es_mapping schema
-                    tuple = {'@timestamp': long(sample_time_ms),
-                             'host-id': self.hostid,
-                             'metric': name}
-                    if True: # XXX: handle strings too
-                      tuple['num-value'] = atom.d
-                    if inst_name is not None:
-                      tuple['instance'] = inst_name
-                      
-                    miv_tuples.append(tuple)
+                    # install value into outgoing json/dict in key=value style
+                    if inst_name is None:
+                        es_doc['metrics'][name] = value
+                    else:
+                        if name in es_doc['metrics']:
+                            es_doc['metrics'][name][inst_name] = value
+                        else:
+                            es_doc['metrics'][name] = {}
+                            es_doc['metrics'][name][inst_name] = value
 
                 except pmapi.pmErr as error:
                     sys.stderr.write("%s[%d]: %s, continuing\n" %
                                      (name, inst, str(error)))
 
-        self.send(miv_tuples)
         self.context.pmFreeResult(result)
+
+        self.es.index(index=self.es_index,
+                      doc_type='pcp-metric', # dummy value
+                      timestamp=long(sample_time_ms), # XXX: ignored on some python-elasticsearch versions
+                      body=es_doc)
 
         self.sample_count += 1
         max_samples = self.opts.pmGetOptionSamples()
