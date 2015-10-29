@@ -121,7 +121,10 @@ network.""")
         # Create elasticsearch "index" (group-of-documents); no mapping
         self.es = Elasticsearch(hosts=[self.elasticsearch_host])
         self.es.indices.create(index=self.es_index,
-                               ignore=[400]) # duplicates allowed
+                               ignore=[400],
+                               body={'mappings':{'pcp-metric':
+                                                 {'properties':{'@timestamp':{'type':'date'},
+                                                                'host-id':{'type':'string'}}}}})
         
         # Report what we're about to do
         print("Relaying %d %smetric(s) with es_index %s from %s "
@@ -207,25 +210,6 @@ network.""")
             pmidA[i] = c_uint(p)
         return pmidA
 
-    def send(self, miv_tuples):
-        try:
-            bulk_message = []
-            for t in miv_tuples:
-                message = {"_index":"pcp", # see create_index
-                           "_type":"result",
-                           # no _id; auto-generate
-                           "_source": t}
-                bulk_message.append(message)
-
-            if self.debug: # self.context.pmDebug(c_api.PM_DEBUG_APPL0):
-                print("Sending %s" % bulk_message)
-
-            helpers.bulk(self.es, bulk_message)
-        except RuntimeError as err:
-            sys.stderr.write("cannot send message to %s, %s, continuing\n" %
-                             (self.elasticsearch_host, err.strerror))
-            return
-
     def execute(self):
         """ Using a PMAPI context (could be either host or archive),
             fetch and report a fixed set of values related to elasticsearch.
@@ -265,7 +249,6 @@ network.""")
                     else:
                         inst_name = self.context.pmNameInDom(self.descs[i], inst)
 
-
                     if (self.descs[i].contents.type == c_api.PM_TYPE_STRING):
                         atom = self.context.pmExtractValue(
                             result.contents.get_valfmt(i),
@@ -291,11 +274,9 @@ network.""")
                     if inst_name is None:
                         es_doc['metrics'][name] = value
                     else:
-                        if name in es_doc['metrics']:
-                            es_doc['metrics'][name][inst_name] = value
-                        else:
-                            es_doc['metrics'][name] = {}
-                            es_doc['metrics'][name][inst_name] = value
+                        if not (name in es_doc['metrics']):
+                            es_doc['metrics'][name] = []
+                        es_doc['metrics'][name].append({'instance': inst_name, 'value': value})
 
                 except pmapi.pmErr as error:
                     sys.stderr.write("%s[%d]: %s, continuing\n" %
