@@ -77,7 +77,7 @@ network.""")
         self.opts.pmSetLongOption("index", 1, 'm', '',
                                   "elasticsearch index for metric names (default \"pcp\")")
         self.opts.pmSetLongOption("hostid", 1, 'i', '',
-                                  "elasticsearch host-id for measurements (default pcp hostname)")
+                                  "elasticsearch host-id for measurements (default from pmcd.hostname)")
         self.opts.pmSetLongOptionHelp()
 
         self.debug = False
@@ -95,7 +95,7 @@ network.""")
 
         if self.hostid is None:
             self.hostid = self.context.pmGetContextHostName()
-        
+
         self.interval = self.opts.pmGetOptionInterval() or pmapi.timeval(60, 0)
         if self.unitsstr is not None:
             units = self.context.pmParseUnitsStr(self.unitsstr)
@@ -104,7 +104,7 @@ network.""")
         self.pmids = []
         self.descs = []
         metrics = self.opts.pmNonOptionsFromList(sys.argv)
-        
+
         if metrics:
             for m in metrics:
                 try:
@@ -125,7 +125,7 @@ network.""")
                                body={'mappings':{'pcp-metric':
                                                  {'properties':{'@timestamp':{'type':'date'},
                                                                 'host-id':{'type':'string'}}}}})
-        
+
         # Report what we're about to do
         print("Relaying %d %smetric(s) with es_index %s from %s "
               "to %s every %f s" %
@@ -234,16 +234,17 @@ network.""")
                     raise SystemExit
 
         # assemble all metrics into a single document
-        es_doc = {'host-id': self.hostid,
-                  '@timestamp': long(sample_time_ms),
-                  'metrics': {}}
+        # use @-prefixed keys for metadata not coming in from pcp metrics
+        es_doc = {'@host-id': self.hostid,
+                  '@timestamp': long(sample_time_ms)}
 
         for i, name in enumerate(self.metrics):
             for j in range(0, result.contents.get_numval(i)):
                 # a fetch or other error will just omit that data value
                 # from the elasticsearch-bound set
                 try:
-                    inst = result.contents.get_vlist(i, j).inst
+                    inst = result.contents.get_vlist(i,j).inst
+
                     if inst is None or inst < 0:
                         inst_name = None
                     else:
@@ -270,13 +271,36 @@ network.""")
                                 atom.d = atom.d * self.units_mult
                         value = atom.d
 
-                    # install value into outgoing json/dict in key=value style
-                    if inst_name is None:
-                        es_doc['metrics'][name] = value
-                    else:
-                        if not (name in es_doc['metrics']):
-                            es_doc['metrics'][name] = []
-                        es_doc['metrics'][name].append({'instance': inst_name, 'value': value})
+                    # install value into outgoing json/dict in key1{key2{key3=value}} style,
+                    # namely:
+                    # foo.bar.baz=value    =>  foo: { bar: { baz: value ...} }
+                    # foo.bar.noo[0]=value =>  foo: { bar: { @instances:[{@id: 0, noo: value ...} ... ]}
+                    pmns_parts=name.split(".")
+                    pmns_leaf_dict = es_doc
+
+                    # find/create the parent dictionary into which to insert the final component
+                    for pmns_part in pmns_parts[:-1]:
+                        if not(pmns_part in pmns_leaf_dict):
+                            pmns_leaf_dict[pmns_part] = {}
+                        pmns_leaf_dict = pmns_leaf_dict[pmns_part]
+                    last_part = pmns_parts[-1]
+
+                    if inst_name is None: # easy
+                        pmns_leaf_dict[last_part] = value
+                    else: # hard
+                        iarray_name = "@instances"
+                        if not (iarray_name in pmns_leaf_dict):
+                            pmns_leaf_dict[iarray_name] = []
+                        iarray = pmns_leaf_dict[iarray_name]
+                        # find a preexisting {@id: inst_name} object in there, if any
+                        iid_name = "@id"
+                        foundit = False
+                        for k in range(1,len(iarray)):
+                            if iarray[k][iid_name] == inst_name:
+                                iarray[k][last_part] = value
+                                foundit = True
+                        if not foundit:
+                            iarray.append({iid_name:inst_name, last_part: value})
 
                 except pmapi.pmErr as error:
                     sys.stderr.write("%s[%d]: %s, continuing\n" %
@@ -284,8 +308,11 @@ network.""")
 
         self.context.pmFreeResult(result)
 
+        if self.debug:
+            print (json.dumps(es_doc))
+
         self.es.index(index=self.es_index,
-                      doc_type='pcp-metric', # dummy value
+                      doc_type='pcp-metric',
                       timestamp=long(sample_time_ms), # XXX: ignored on some python-elasticsearch versions
                       body=es_doc)
 
